@@ -160,7 +160,7 @@ def populate_table(targetname,sourcename,sourceval,targetdict):
 							
 	return returnarr
 
-def write_datatable_json(dataframe,filename,cssid='datatable',elementid="tableinput",fixpos=None,script='local',title=None,visible=[]):
+def write_datatable_json(dataframe,filename,cssid='datatable',elementid="tableinput",fixpos=None,script='global',title=None,visible=[]):
 
 	'''
 	Convert a dataframe into a html file. Here the data is stored as a JSON file which is rendered
