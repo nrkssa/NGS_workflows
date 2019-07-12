@@ -1,0 +1,220 @@
+# RNA-seq pipeline using STAR aligner
+# pre-requisites 
+# fastqc, STAR, STAR genome index, CUFFLINKS, CUFFQUANT, CUFFNORM, stringtie
+
+# required folder structure
+
+# 	 fastq
+#    |- sample1
+#    |- |- forward.fastq.gz, reverse.fastq.gz
+#    |- sample2	
+#    |- |- forward.fastq.gz, reverse.fastq.gz
+
+#!/bin/bash
+module load anaconda/3.6
+source activate ngs
+
+declare -A genomesize
+genomesize=(["HG19"]=2736124973 ["GRCH37"]=2736124973
+			["HG38"]=2747877777 ["GRCH38"]=2747877777
+			["MM9"]=2404646224  ["GRCM37"]=2404646224
+			["MM10"]=2407883318 ["GRCM38"]=2407883318)
+
+## parse command line info
+numthreads=10
+while getopts "g:f:n::" opt; do
+	case $opt in
+	g) refgenome=$OPTARG ;;
+	f) fastq=$OPTARG ;;
+	n) numthreads=$OPTARG ;;
+	esac
+done
+fastqfiles=${fastq[@]}
+genomename=$(echo $refgenome | cut -f 1 -d '-')
+effgenomesize=${genomesize[${genomename^^}]}
+
+if [[ `hostname | cut -f 1 -d '.'` == "cbi-asang-009" ]]; then
+	genomedir=/media/data1/genome/$refgenome/STAR-index
+	gtffile=/media/data1/genome/$refgenome/annotation.gtf
+else
+	genomedir=$HOME/genome/$refgenome/STAR-index
+	gtffile=$HOME/genome/$refgenome/annotation.gtf
+fi
+
+if [ ! -f filelist.txt ]; then
+	for files in $fastqfiles; do
+		for file in $files/*; do
+		echo $file
+			echo  $file >> filelist.txt
+		done
+	done
+fi
+
+#run over all fastqfiles
+for fastqdir in `cat filelist.txt`
+do
+	fastqprefix=`echo $fastqdir | grep -o '[^/]*$'`
+	mkdir $fastqprefix
+	echo `date` "; Analyzing system $fastqprefix" >$fastqprefix/runLog.log 2>&1
+	
+	# determine whether data is for single-end or paired-end sequence
+	nfastq=`ls $fastqdir/*.gz | wc -l`
+	if [[ $nfastq -eq 2 ]]; then 
+		ffastq=$fastqdir/forward.fastq.gz
+		rfastq=$fastqdir/reverse.fastq.gz
+		if [[ -f $ffastq && -r $rfastq ]]; then
+		strandtype="fr-firststrand"
+			echo "Both forward and reverse file have been detected. Running analysis in paired_end mode ">>$fastqprefix/runLog.log 2>&1
+		else
+			echo "The fastq filenames do not appear to be correct. We expect the file names to be $ffastq $rfastq">>$fastqprefix/runLog.log 2>&1
+			echo "Exiting: Fix this error and restart">>$fastqprefix/runLog.log 2>&1
+			exit
+		fi
+		samflag=3340
+
+	elif [[ $nfastq -eq 1 ]]; then
+		ffastq=`ls $fastqdir/*.gz`
+		rfastq=
+		strandtype="fr-firststrand"
+		samflag=3332
+		echo "Forward sequence file has been detected. Running analysis in single_end mode ">>$fastqprefix/runLog.log 2>&1
+	else
+		echo "No fastq files found in folder $fastqprefix">>$fastqprefix/runLog.log 2>&1
+		echo "Exiting run ">>$fastqprefix/runLog.log 2>&1
+		exit
+	fi
+		
+	## FASTQC
+	QCdir=$fastqprefix/QC-LOG
+	mkdir -pv $QCdir >>$fastqprefix/runLog.log
+
+	## Check for QC files 
+	runQC=1
+	if [[ (-s $QCdir/forward_fastqc.html)  ]]; then
+		runQC=0
+		if [[ ($nfastq -eq 2) && (-s $QCdir/reverse_fastqc.html) ]]; then
+			runQC=0
+		else
+			runQC=1
+		fi
+	fi
+
+	if [[ $runQC -eq 1 ]]; then
+		echo `date` "; a. ---> Check read quality using FASTQC: results are stored to $QCdir" >>$fastqprefix/runLog.log 2>&1
+		echo `date` "; 	       FASTQC logs are written to $QCdir/Log.out" >> $fastqprefix/runLog.log  2>&1
+		
+		fastqc $ffastq $rfastq -o $QCdir -t $numthreads > $QCdir/QClog.log 2>&1
+		echo `date` ";         Completed FASTQC Analysis" >> $fastqprefix\/runLog.log 2>&1
+
+		echo " ">> $fastqprefix\/runLog.log 2>&1
+		echo " ">> $fastqprefix\/runLog.log 2>&1
+	else
+		echo `date` "; a. ---> FASTQC results are already present in $QCdir" >>$fastqprefix/runLog.log 2>&1
+	fi
+
+	## alignment using STAR (attributes similar to that used in basespace)
+	STAR=$fastqprefix/STAR
+
+	if [[ -s $STAR/Aligned.out.bam ]]; then
+		echo `date` "; b. Found pre-aligned bam files" >> $fastqprefix\/runLog.log 2>&1
+	else
+		mkdir -pv $STAR >>$fastqprefix/runLog.log 2>&1
+		echo `date` "; b. ---> Running STAR aligner " >> $fastqprefix\/runLog.log 2>&1
+		echo `date` ";  STAR logs are written to $STAR/Log.out" >> $fastqprefix\/runLog.log 2>&1
+		STAR  --genomeDir $genomedir --sjdbGTFfile $gtffile --readFilesIn $ffastq $rfastq --outSAMtype BAM Unsorted \
+			  --outFilterType BySJout --outSJfilterCountUniqueMin -1 2 2 2 --outSJfilterCountTotalMin -1 2 2 2 \
+			  --outFilterIntronMotifs RemoveNoncanonical --twopassMode Basic \
+			  --outSAMattributes NH NM MD --outSAMunmapped Within --outSAMmapqUnique 50 --limitBAMsortRAM 24000000000 \
+			  --outFileNamePrefix $STAR\/  --readFilesCommand zcat --runThreadN $numthreads --quantMode GeneCounts  > $STAR/STARlog.log 2>&1
+		
+		echo `date` ";   Completed STAR alignment" >> $fastqprefix\/runLog.log 2>&1
+		echo " ">> $fastqprefix\/runLog.log 2>&1
+		echo " ">> $fastqprefix\/runLog.log 2>&1
+	fi
+
+
+	### Extract primary reads from the alignment file (keep only primary reads with PHRED score >30)
+
+	if [[ -s $STAR/Aligned.out.primary.rmdup.sorted.bam ]]; then
+		echo `date` ";   Found previously generated file: $STAR\/Aligned.out.primary.rmdup.sorted.bam" >> $fastqprefix\/runLog.log
+	else
+		echo `date` "; c1. ---> Extracting primary reads from the aligned bam file" >> $fastqprefix\/runLog.log
+		samtools view -b -q 30 -F $samflag  -o $STAR\/Aligned.out.primary.rmdup.bam $STAR\/Aligned.out.bam
+		echo `date` "; c2. ---> Sorting primary BAM" >> $fastqprefix\/runLog.log
+		samtools sort -@ $numthreads -o $STAR\/Aligned.out.primary.rmdup.sorted.bam $STAR\/Aligned.out.primary.rmdup.bam 
+		echo `date` "; c3. ---> Generating Index for PCR duplicate free sorted BAM" >> $fastqprefix\/runLog.log
+		samtools index -@ $numthreads $STAR\/Aligned.out.primary.rmdup.sorted.bam
+		echo `date` ";   Completed BAM file generation" >> $fastqprefix\/runLog.log
+		echo " ">> $fastqprefix\/runLog.log
+		echo " ">> $fastqprefix\/runLog.log
+	fi
+
+
+	# make a bigwig track
+	BIGWIG=$fastqprefix/BIGWIG
+	mkdir -pv $BIGWIG >>$fastqprefix/runLog.log 2>&1
+
+	if [[ -s $BIGWIG\/Aligned.out.primary.rmdup.sorted.bw ]]; then
+		echo `date` ";  d. Found previously generated BIGWIG file: $BIGWIG\/Aligned.out.primary.rmdup.sorted.bw" >> $fastqprefix\/runLog.log
+	
+	else
+		echo `date` "; d. ---> Convering to BAM to bigwig" >> $fastqprefix\/runLog.log 2>&1
+		bamCoverage -b $STAR\/Aligned.out.primary.rmdup.sorted.bam -o $BIGWIG\/Aligned.out.primary.rmdup.sorted.bw\
+			 -of bigwig -p $numthreads --effectiveGenomeSize $effgenomesize  --normalizeUsing RPKM -bs 1 > $BIGWIG/BIGWIGlog.log 2>&1
+		echo `date` ";   Completed conversion to bigwig" >> $fastqprefix\/runLog.log 2>&1
+		echo " ">> $fastqprefix\/runLog.log 2>&1
+		echo " ">> $fastqprefix\/runLog.log 2>&1
+	fi
+
+	bam_to_process=$STAR/Aligned.out.primary.rmdup.sorted.bam
+
+	### quantify using stringtie
+	STRINGTIE=$fastqprefix/STRINGTIE
+	mkdir -pv $STRINGTIE >>$fastqprefix/runLog.log 2>&1
+	echo `date` "; e. ---> Running stringtie assembler with reference annotation" >> $fastqprefix\/runLog.log 2>&1
+	stringtie $bam_to_process -o $STRINGTIE\/Aligned.sortedByCoord.out.gtf -A $STRINGTIE\/count.tab \
+			  -G $gtffile -p $numthreads -fr -B  > $STRINGTIE/STRINGTIElog.log 2>&1
+	echo `date` ";   Completed stringtie assembly" >> $fastqprefix\/runLog.log 2>&1
+	echo " ">> $fastqprefix\/runLog.log 2>&1
+	echo " ">> $fastqprefix\/runLog.log 2>&1
+
+	### quantify using cufflinks
+	CUFFLINKS=$fastqprefix/CUFFLINKS
+	mkdir -pv $CUFFLINKS >>$fastqprefix/runLog.log 2>&1
+	echo `date` "; f. ---> Running cufflinks on $fastqprefix" >> $fastqprefix\/runLog.log 2>&1
+	cufflinks -p $numthreads -o $CUFFLINKS --library-type $strandtype  -G $gtffile $bam_to_process > $CUFFLINKS/CUFFLINKSlog.log 2>&1
+	echo "   Completed cufflinks assembly" >> $fastqprefix\/runLog.log 2>&1
+	echo " ">> $fastqprefix\/runLog.log 2>&1
+	echo " ">> $fastqprefix\/runLog.log 2>&1
+	
+	### quantify using cuffquant
+	CUFFQUANT=$fastqprefix/CUFFQUANT
+	mkdir -pv  $CUFFQUANT >>$fastqprefix/runLog.log 2>&1
+	echo `date` "; g. ---> Running cuffquant on $fastqprefix" >> $fastqprefix\/runLog.log 2>&1
+	cuffquant -p $numthreads -o $CUFFQUANT --library-type $strandtype  $gtffile $bam_to_process > $CUFFQUANT/CUFFQUANTlog.log 2>&1
+	echo `date` ";   Completed cuffquant" >> $fastqprefix\/runLog.log 2>&1
+	echo " ">> $fastqprefix\/runLog.log 2>&1
+	echo " ">> $fastqprefix\/runLog.log 2>&1
+	
+	### quantify using cuffnorm
+	CUFFNORM=$fastqprefix/CUFFNORM
+	mkdir -pv $CUFFNORM >>$fastqprefix/runLog.log 2>&1
+	echo `date` "; h. ---> Running cuffnorm on $fastqprefix" >> $fastqprefix\/runLog.log 2>&1
+	cuffnorm -p $numthreads -o $CUFFNORM --library-type $strandtype  $gtffile \
+				$CUFFQUANT\/abundances.cxb $CUFFQUANT\/abundances.cxb > $CUFFNORM/CUFFNORMlog.log 2>&1
+	echo `date` ";   Completed cuffnorm" >> $fastqprefix\/runLog.log 2>&1
+	echo " ">> $fastqprefix\/runLog.log 2>&1
+	echo " ">> $fastqprefix\/runLog.log 2>&1
+	
+	echo `date` "; completed analysis for system : $fastqprefix" >> $fastqprefix\/runLog.log 2>&1
+done
+
+
+#assemble various fpkm and count values into a table
+echo `assembling data from cuffnorm`
+python ./processing_scripts/bin/assemble-cuffnorm-fpkm-count.py
+python ./processing_scripts/bin/assemble-stringtie-fpkm-tpm.py
+
+#perform PCA analysis
+echo `Performing PCA analysis`
+python ./processing_scripts/bin/run_pca_genes.py
